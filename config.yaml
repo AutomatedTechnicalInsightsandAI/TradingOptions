@@ -1,0 +1,54 @@
+# ── Watchlist ──────────────────────────────────────────────────────────────────
+# QQQ ETF plus its top-10 holdings (as of 2025)
+watchlist:
+  - QQQ
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - META
+  - GOOGL
+  - TSLA
+  - AVGO
+  - COST
+  - NFLX
+
+# ── Scanner settings ───────────────────────────────────────────────────────────
+scanner:
+  # Minimum volume-to-open-interest ratio to flag as unusual activity
+  uoa_vol_oi_ratio: 5.0
+  # Minimum option volume to include in scan (filters out illiquid contracts)
+  min_volume: 50
+  # Maximum bid-ask spread (as pct of mid-price) to consider "tight"
+  max_spread_pct: 0.20
+  # Days-to-expiration window to consider [min, max]
+  dte_range: [7, 60]
+  # Number of top ranked candidates to display
+  top_n: 20
+
+# ── Strategy engine ────────────────────────────────────────────────────────────
+strategy:
+  # Minimum reward-to-risk ratio required to recommend a trade
+  min_reward_risk: 2.0
+  # Target probability-of-profit range for long options [min, max]
+  pop_range: [0.35, 0.65]
+  # Risk per trade as a fraction of account size
+  risk_per_trade: 0.02
+  # Notional account size (for position-sizing display only)
+  account_size: 25000
+
+# ── Greeks / IV settings ───────────────────────────────────────────────────────
+greeks:
+  # Risk-free rate (annualised, decimal)
+  risk_free_rate: 0.053
+  # IV solver tolerance
+  iv_tolerance: 1.0e-6
+  # IV solver max iterations
+  iv_max_iter: 500
+  # Historical volatility look-back window (trading days)
+  hv_window: 30
+
+# ── Dashboard refresh ──────────────────────────────────────────────────────────
+dashboard:
+  # Auto-refresh interval in seconds (0 = manual only)
+  refresh_seconds: 300
