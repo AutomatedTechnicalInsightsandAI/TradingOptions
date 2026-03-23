@@ -233,7 +233,9 @@ def fetch_option_chain(
 
                         g = calculate_greeks(contract)
 
-                        vol_oi = (volume / oi) if oi > 0 else float("inf")
+                        # Cap Vol/OI at 999 when OI is zero to avoid inf in
+                        # sorting, display, and numerical operations.
+                        vol_oi = (volume / oi) if oi > 0 else 999.0
                         is_uoa = vol_oi >= uoa_vol_oi_ratio
 
                         rows.append(

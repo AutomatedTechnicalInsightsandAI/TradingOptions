@@ -271,7 +271,7 @@ class TestPoP:
         assert pop == pytest.approx(0.50)
 
     def test_pop_long_call_deep_otm(self):
-        pop = pop_long_call(0.05)   # delta=0.05 → PoP ≈ 0.95 (rarely right)
+        pop = pop_long_call(0.05)   # delta=0.05 → PoP ≈ 0.95 (only ~5% chance to finish ITM)
         assert pop == pytest.approx(0.95)
 
     def test_pop_bounded(self):

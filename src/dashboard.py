@@ -54,7 +54,7 @@ CFG = _load_config()
 
 # ── Page setup ─────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="TradingOptions – QQQ Top-10 Scanner",
+    page_title="TradingOptions – Options Analytics Dashboard",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -142,7 +142,7 @@ ranked: pd.DataFrame = st.session_state["ranked"]
 recommendations: list[TradeRecommendation] = st.session_state["recommendations"]
 
 # ── Header ─────────────────────────────────────────────────────────────────────
-st.title("📈 TradingOptions – QQQ Top-10 Scanner")
+st.title("📈 TradingOptions – Options Analytics Dashboard")
 
 if results:
     last_time = st.session_state["last_scan_time"]

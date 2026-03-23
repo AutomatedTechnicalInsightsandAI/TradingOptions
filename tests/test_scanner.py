@@ -163,10 +163,12 @@ class TestFetchOptionChain:
 
     def test_uoa_flagging(self, mock_scan_result):
         df = mock_scan_result.contracts
-        # vol/OI ratio > 5 should be flagged
-        flagged = df[df["is_uoa"]]
+        # All contracts with vol/OI >= 5 must be flagged
         high_ratio = df[df["vol_oi_ratio"] >= 5.0]
-        assert set(high_ratio.index).issubset(set(flagged.index))
+        assert set(high_ratio.index).issubset(set(df[df["is_uoa"]].index))
+        # No contract with vol/OI < 5 should be flagged (no false positives)
+        low_ratio = df[df["vol_oi_ratio"] < 5.0]
+        assert len(df[df["is_uoa"]].index.intersection(low_ratio.index)) == 0
 
     def test_returns_none_for_empty_history(self):
         mock = _make_mock_ticker()
