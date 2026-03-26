@@ -200,8 +200,10 @@ def fetch_option_chain(
                         strike = float(row.get("strike", 0))
                         bid = float(row.get("bid", 0) or 0)
                         ask = float(row.get("ask", 0) or 0)
-                        volume = int(row.get("volume", 0) or 0)
-                        oi = int(row.get("openInterest", 0) or 0)
+                        raw_vol = row.get("volume", 0)
+                        volume = int(raw_vol) if pd.notna(raw_vol) and raw_vol else 0
+                        raw_oi = row.get("openInterest", 0)
+                        oi = int(raw_oi) if pd.notna(raw_oi) and raw_oi else 0
                         last = float(row.get("lastPrice", 0) or 0)
 
                         if volume < min_volume:
