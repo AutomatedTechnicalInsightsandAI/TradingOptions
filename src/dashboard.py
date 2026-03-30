@@ -296,7 +296,7 @@ if selected_ticker:
     # ── Tab 1: Volatility Smile ────────────────────────────────────────────
     with tab1:
         st.subheader("Volatility Smile / Skew")
-        df = res.contracts
+        df = res.all_contracts
 
         for exp in sorted(df["expiry"].unique())[:3]:  # show up to 3 nearest expiries
             exp_df = df[df["expiry"] == exp]
@@ -336,7 +336,7 @@ if selected_ticker:
     # ── Tab 2: Options Flow Analysis ──────────────────────────────────────
     with tab2:
         st.subheader("📊 Options Flow Analysis")
-        df = res.contracts.copy()
+        df = res.all_contracts.copy()
 
         # ── Section 1: Trend Overlay (Dual-Axis Chart) ─────────────────
         st.markdown("#### 📈 Section 1 — Price vs. Total OI Trend Overlay")
@@ -603,7 +603,24 @@ if selected_ticker:
     # ── Tab 3: Options Chain ──────────────────────────────────────────────
     with tab3:
         st.subheader("Full Options Chain")
-        disp = res.contracts.copy()
+        disp = res.all_contracts.copy()
+
+        # ── Filter controls ───────────────────────────────────────────────
+        all_expiries = sorted(disp["expiry"].unique().tolist())
+        selected_expiries = st.multiselect(
+            "Expiry", all_expiries, default=all_expiries, key="chain_expiry_filter"
+        )
+        opt_type_filter = st.radio(
+            "Option Type", ["All", "Calls", "Puts"],
+            horizontal=True, key="chain_type_filter"
+        )
+
+        if selected_expiries:
+            disp = disp[disp["expiry"].isin(selected_expiries)]
+        if opt_type_filter == "Calls":
+            disp = disp[disp["option_type"] == "call"]
+        elif opt_type_filter == "Puts":
+            disp = disp[disp["option_type"] == "put"]
         disp["iv_%"] = (disp["iv"] * 100).round(1)
         disp = disp[[
             "expiry", "dte", "option_type", "strike", "bid", "ask", "mid",

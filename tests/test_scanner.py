@@ -170,6 +170,51 @@ class TestFetchOptionChain:
         low_ratio = df[df["vol_oi_ratio"] < 5.0]
         assert len(df[df["is_uoa"]].index.intersection(low_ratio.index)) == 0
 
+    def test_all_contracts_dataframe_nonempty(self, mock_scan_result):
+        assert not mock_scan_result.all_contracts.empty
+
+    def test_all_contracts_have_required_columns(self, mock_scan_result):
+        required = {"ticker", "expiry", "dte", "option_type", "strike",
+                    "iv", "delta", "gamma", "theta", "vega", "is_uoa",
+                    "vol_oi_ratio", "spread_pct", "open_interest", "volume"}
+        assert required.issubset(set(mock_scan_result.all_contracts.columns))
+
+    def test_all_contracts_superset_of_contracts(self, mock_scan_result):
+        """all_contracts must have at least as many rows as the filtered contracts."""
+        assert len(mock_scan_result.all_contracts) >= len(mock_scan_result.contracts)
+
+    def test_nan_oi_treated_as_zero(self):
+        """NaN openInterest values from yfinance should be treated as 0, not propagated."""
+        mock = _make_mock_ticker()
+        # Introduce NaN openInterest in one call row
+        calls_df = mock.option_chain.return_value.calls.copy()
+        calls_df.loc[0, "openInterest"] = float("nan")
+        mock.option_chain.return_value.calls = calls_df
+        with patch("src.scanner.yf.Ticker", return_value=mock):
+            result = fetch_option_chain("FAKE", dte_range=(0, 3000), min_volume=0, max_spread_pct=1.0)
+        assert result is not None
+        nan_strike_rows = result.all_contracts[result.all_contracts["strike"] == 480.0]
+        call_rows = nan_strike_rows[nan_strike_rows["option_type"] == "call"]
+        if not call_rows.empty:
+            assert call_rows["open_interest"].iloc[0] == 0
+
+    def test_low_volume_contracts_in_all_contracts(self):
+        """Contracts below min_volume threshold must appear in all_contracts but not contracts."""
+        mock = _make_mock_ticker()
+        with patch("src.scanner.yf.Ticker", return_value=mock):
+            result = fetch_option_chain(
+                "FAKE",
+                dte_range=(0, 3000),
+                min_volume=1000,   # high threshold: some contracts will be filtered out
+                max_spread_pct=1.0,
+            )
+        assert result is not None
+        # all_contracts has the full set
+        assert len(result.all_contracts) == 10  # 5 calls + 5 puts
+        # contracts only has those that meet min_volume=1000
+        high_vol = result.all_contracts[result.all_contracts["volume"] >= 1000]
+        assert len(result.contracts) == len(high_vol)
+
     def test_returns_none_for_empty_history(self):
         mock = _make_mock_ticker()
         mock.history.return_value = pd.DataFrame()
