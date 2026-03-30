@@ -92,8 +92,9 @@ class ScanResult:
     iv_percentile_value: float
     iv_vs_hv: float           # atm_iv / hv_30 ratio
     oi_walls: list[float]     # price levels with highest OI concentration
-    contracts: pd.DataFrame   # full enriched chain
+    contracts: pd.DataFrame   # volume/spread-filtered chain (for UOA & ranking)
     uoa_alerts: pd.DataFrame  # filtered UOA rows
+    all_contracts: pd.DataFrame = field(default_factory=pd.DataFrame)  # full unfiltered chain
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +176,8 @@ def fetch_option_chain(
             logger.warning("No options data for %s", ticker)
             return None
 
-        rows: list[ContractRow] = []
+        rows: list[ContractRow] = []       # volume/spread-filtered (UOA & ranking)
+        all_rows: list[ContractRow] = []   # every valid contract (display & smile)
         all_iv_values: list[float] = []
 
         for expiry in expirations:
@@ -200,21 +202,23 @@ def fetch_option_chain(
                         strike = float(row.get("strike", 0))
                         bid = float(row.get("bid", 0) or 0)
                         ask = float(row.get("ask", 0) or 0)
-                        volume = int(row.get("volume", 0) or 0)
-                        oi = int(row.get("openInterest", 0) or 0)
-                        last = float(row.get("lastPrice", 0) or 0)
 
-                        if volume < min_volume:
-                            continue
+                        # Explicit NaN → 0 handling (yfinance returns NaN for
+                        # intraday new contracts that have no reported data yet)
+                        vol_raw = row.get("volume", 0)
+                        volume = int(vol_raw) if pd.notna(vol_raw) and vol_raw > 0 else 0
+
+                        oi_raw = row.get("openInterest", 0)
+                        oi = int(oi_raw) if pd.notna(oi_raw) and oi_raw > 0 else 0
+
+                        last = float(row.get("lastPrice", 0) or 0)
 
                         mid = _mid_price(bid, ask)
                         sp_pct = _spread_pct(bid, ask)
 
-                        if sp_pct > max_spread_pct and max_spread_pct > 0:
-                            continue
-
                         market_price = mid if mid > 0 else last
                         if market_price <= 0:
+                            # Cannot compute IV without a price; skip entirely
                             continue
 
                         contract = OptionContract(
@@ -238,42 +242,53 @@ def fetch_option_chain(
                         vol_oi = (volume / oi) if oi > 0 else 999.0
                         is_uoa = vol_oi >= uoa_vol_oi_ratio
 
-                        rows.append(
-                            ContractRow(
-                                ticker=ticker,
-                                expiry=expiry,
-                                dte=dte,
-                                option_type=opt_type,
-                                strike=strike,
-                                last_price=last,
-                                bid=bid,
-                                ask=ask,
-                                mid=mid,
-                                spread_pct=sp_pct,
-                                volume=volume,
-                                open_interest=oi,
-                                vol_oi_ratio=vol_oi,
-                                iv=iv,
-                                delta=g.delta,
-                                gamma=g.gamma,
-                                theta=g.theta,
-                                vega=g.vega,
-                                theoretical_price=g.theoretical_price,
-                                is_uoa=is_uoa,
-                                underlying_price=underlying_price,
-                            )
+                        contract_row = ContractRow(
+                            ticker=ticker,
+                            expiry=expiry,
+                            dte=dte,
+                            option_type=opt_type,
+                            strike=strike,
+                            last_price=last,
+                            bid=bid,
+                            ask=ask,
+                            mid=mid,
+                            spread_pct=sp_pct,
+                            volume=volume,
+                            open_interest=oi,
+                            vol_oi_ratio=vol_oi,
+                            iv=iv,
+                            delta=g.delta,
+                            gamma=g.gamma,
+                            theta=g.theta,
+                            vega=g.vega,
+                            theoretical_price=g.theoretical_price,
+                            is_uoa=is_uoa,
+                            underlying_price=underlying_price,
                         )
+
+                        # Every priceable contract goes into the full chain
+                        all_rows.append(contract_row)
                         all_iv_values.append(iv)
+
+                        # Only volume/spread-qualifying contracts go to the
+                        # filtered set used for UOA detection and ranking
+                        passes_volume = volume >= min_volume
+                        passes_spread = max_spread_pct <= 0 or sp_pct <= max_spread_pct
+                        if passes_volume and passes_spread:
+                            rows.append(contract_row)
 
                     except Exception as exc:
                         logger.debug("Row error for %s %s: %s", ticker, expiry, exc)
                         continue
 
-        if not rows:
+        if not all_rows:
             logger.warning("No qualifying contracts found for %s", ticker)
             return None
 
-        df_all = pd.DataFrame([vars(r) for r in rows])
+        # Full unfiltered chain (used for smile, chain tab, OI charts)
+        df_all = pd.DataFrame([vars(r) for r in all_rows])
+        # Volume/spread-filtered chain (used for UOA alerts and ranking)
+        df_filtered = pd.DataFrame([vars(r) for r in rows]) if rows else df_all
 
         # ── ATM IV ────────────────────────────────────────────────────────
         call_df = df_all[df_all["option_type"] == "call"].copy()
@@ -295,7 +310,7 @@ def fetch_option_chain(
         oi_walls = top_oi["strike"].tolist()
 
         # ── UOA alerts ───────────────────────────────────────────────────
-        uoa_df = df_all[df_all["is_uoa"]].copy()
+        uoa_df = df_filtered[df_filtered["is_uoa"]].copy()
 
         return ScanResult(
             ticker=ticker,
@@ -306,8 +321,9 @@ def fetch_option_chain(
             iv_percentile_value=ivp,
             iv_vs_hv=atm_iv / hv_30 if hv_30 > 0 else float("nan"),
             oi_walls=oi_walls,
-            contracts=df_all,
+            contracts=df_filtered,
             uoa_alerts=uoa_df,
+            all_contracts=df_all,
         )
 
     except Exception as exc:
