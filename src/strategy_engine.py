@@ -1,33 +1,25 @@
 """
-Strategy Engine – suggests trades with IV-aware strategy selection.
+Strategy Engine – directional ATM long-option recommendations for a cash account.
 
 Workflow
 --------
-1. Accept a market view (bullish / bearish) and a volatility view (high / low)
-2. Filter scan results to contracts matching the directional bias
-3. Apply risk/reward and PoP gates
-4. Select strategy type based on IV Rank regime
-5. Return ranked trade recommendations with position sizing
-
-Strategy selection based on IV Rank:
-  IV Rank < 30%  → Long Call / Long Put (buy cheap premium)
-  IV Rank 30–50% → Bull/Bear Debit Spread
-  IV Rank 50–70% → Bull Put / Bear Call Credit Spread
-  IV Rank > 70%  → Iron Condor
+1. Accept a market view (bullish / bearish / neutral)
+2. Determine directional side (call or put) from market view + UOA flow + IV skew
+3. Filter ranked candidates to ATM contracts only (within 2 % of spot)
+4. Apply max-premium-per-contract cap
+5. Return up to 5 ranked ATM trade recommendations with position sizing
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from .greeks import (
-    OptionContract,
-    calculate_greeks,
     call_payoff_at_expiry,
     pop_long_call,
     pop_long_put,
@@ -45,15 +37,20 @@ StrategyType = Literal[
     "Iron Condor", "Long Straddle", "Long Strangle",
 ]
 
-# IV Rank regime thresholds (0–100 scale)
-_IV_LOW = 30.0    # below → buy premium
-_IV_MOD = 50.0    # 30–50 → debit spread
-_IV_HIGH = 70.0   # 50–70 → credit spread; above → Iron Condor
+# ATM tolerance: strike must be within this fraction of the underlying price
+_ATM_TOLERANCE = 0.02
 
-# Proxy spread width used when exact short-strike prices are unavailable.
-# Entry × 1.5 approximates a typical 50% OTM short leg, keeping max-loss
-# and reward/risk calculations in a realistic range.
-_SPREAD_WIDTH_MULTIPLIER = 1.5
+# Wider ATM window used when comparing call vs put IV for skew analysis
+_IV_SKEW_ATM_WINDOW = 0.05
+
+# Threshold ratio for detecting a meaningful IV skew between calls and puts
+_IV_SKEW_THRESHOLD = 1.05
+
+# Minimum UOA contract count difference to consider a directional UOA signal significant
+_UOA_SIGNIFICANCE_THRESHOLD = 2
+
+# Guard against division-by-zero when underlying price is near zero
+_MIN_UNDERLYING_PRICE = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +80,8 @@ class TradeRecommendation:
     strategy_type: StrategyType = "Long Call"
     strategy_legs: str = ""
     rationale: str = ""
+    directional_verdict: str = ""   # e.g. "🟢 BUY CALL — Bullish UOA + IV skew"
+    directional_confidence: str = ""  # "High" / "Medium" / "Low"
 
 
 # ---------------------------------------------------------------------------
@@ -91,27 +90,24 @@ class TradeRecommendation:
 
 class StrategyEngine:
     """
-    Recommend trades given a directional and volatility view.
+    Recommend directional ATM long-option trades for a cash account.
 
-    Strategy is selected based on IV Rank:
-      IV Rank < 30%  → Long Call / Long Put (buy cheap premium)
-      IV Rank 30–50% → Bull/Bear Debit Spread
-      IV Rank 50–70% → Bull Put / Bear Call Credit Spread
-      IV Rank > 70%  → Iron Condor
+    Strategy is always Long Call or Long Put — no spreads or credit strategies.
+    The recommended side is derived from:
+      1. ``market_view`` — primary input (bullish → call, bearish → put)
+      2. UOA flow   — unusual call/put activity detected in ``ranked_candidates``
+      3. IV skew    — whether call IV or put IV is elevated at ATM
 
     Parameters
     ----------
     market_view:
-        ``"bullish"`` → long calls/bull spreads, ``"bearish"`` → long puts/bear spreads,
-        ``"neutral"`` → both.
+        ``"bullish"`` → Long Call, ``"bearish"`` → Long Put,
+        ``"neutral"`` → side determined by UOA flow + IV skew.
     vol_view:
-        ``"high"`` → prefer contracts where IV > HV (breakout/momentum potential).
-        ``"low"``  → prefer contracts where IV < HV (cheap options).
-        ``"neutral"`` → no filter.
-    min_reward_risk:
-        Minimum reward-to-risk ratio at the 2× target.
-    pop_range:
-        ``(min_pop, max_pop)`` – keeps contracts with reasonable profit probability.
+        Kept for API compatibility; no longer used to gate recommendations.
+    max_premium:
+        Maximum option premium per contract in dollars (entry_price × 100).
+        Contracts more expensive than this cap are filtered out.
     account_size:
         Account size in dollars for position sizing.
     risk_per_trade:
@@ -122,15 +118,16 @@ class StrategyEngine:
         self,
         market_view: MarketView = "bullish",
         vol_view: VolView = "neutral",
-        min_reward_risk: float = 2.0,
-        pop_range: tuple[float, float] = (0.30, 0.65),
+        max_premium: float = 500.0,
         account_size: float = 25_000,
         risk_per_trade: float = 0.02,
+        # Legacy params kept for backward compatibility — ignored internally
+        min_reward_risk: float = 2.0,
+        pop_range: tuple[float, float] = (0.30, 0.65),
     ) -> None:
         self.market_view = market_view
         self.vol_view = vol_view
-        self.min_reward_risk = min_reward_risk
-        self.pop_range = pop_range
+        self.max_premium = max_premium
         self.account_size = account_size
         self.risk_per_trade = risk_per_trade
 
@@ -142,92 +139,92 @@ class StrategyEngine:
         """
         Filter *ranked_candidates* (output of :func:`scanner.rank_candidates`)
         and return a list of :class:`TradeRecommendation` objects.
+
+        Always recommends Long Call or Long Put — no spreads or credit strategies.
+        Filters to ATM contracts only (within 2 % of spot) and applies the
+        ``max_premium`` cap.  Returns up to 5 recommendations.
         """
         if ranked_candidates.empty:
             return []
 
-        recs: list[TradeRecommendation] = []
+        side, verdict, confidence = self._compute_directional_signal(ranked_candidates)
+        strategy_type: StrategyType = "Long Call" if side == "call" else "Long Put"
+
+        recs_with_volume: list[tuple[TradeRecommendation, float]] = []
 
         for _, row in ranked_candidates.iterrows():
             opt_type = row["type"]
 
-            # Directional filter
-            if self.market_view == "bullish" and opt_type != "call":
-                continue
-            if self.market_view == "bearish" and opt_type != "put":
-                continue
-
-            # Volatility view filter
-            iv_vs_hv = row.get("iv_vs_hv", 1.0)
-            if self.vol_view == "high" and iv_vs_hv < 1.0:
-                continue
-            if self.vol_view == "low" and iv_vs_hv > 1.0:
+            # Only the recommended side
+            if opt_type != side:
                 continue
 
             entry = float(row["mid"])
+            underlying = float(row["underlying"])
+            strike = float(row["strike"])
+
+            # ATM filter: strike within 2 % of underlying
+            if underlying > 0 and abs(strike - underlying) / underlying > _ATM_TOLERANCE:
+                continue
+
+            # Max premium cap
+            if entry * 100 > self.max_premium:
+                continue
+
             delta = float(row["delta"])
             theta = float(row["theta"])
             vega = float(row["vega"])
             iv = float(row["iv"]) / 100.0  # convert back from percent
             iv_rank = float(row.get("iv_rank", 50))
+            volume = float(row.get("volume", 0))
 
-            # PoP calculation (per-contract, 1 lot = 100 shares)
             if opt_type == "call":
                 pop = pop_long_call(delta)
             else:
                 pop = pop_long_put(delta)
 
-            if not (self.pop_range[0] <= pop <= self.pop_range[1]):
-                continue
+            max_loss_per_contract = entry * 100
 
-            # Select strategy based on IV rank
-            strategy_type, strategy_legs = self._select_strategy(opt_type, iv_rank, iv_vs_hv, delta)
-
-            # Risk / reward — credit strategies use spread-width proxy
-            is_credit = strategy_type in (
-                "Bull Put Credit Spread", "Bear Call Credit Spread", "Iron Condor"
-            )
-            if is_credit:
-                spread_width = entry * _SPREAD_WIDTH_MULTIPLIER
-                max_loss_per_contract = (spread_width - entry) * 100
-                reward_risk = entry / (spread_width - entry) if (spread_width - entry) > 0 else 0
-            else:
-                max_loss_per_contract = entry * 100  # entire premium
-                target_profit = entry * 2 * 100      # 2× target
-                reward_risk = target_profit / max_loss_per_contract if max_loss_per_contract > 0 else 0
-
-            if reward_risk < self.min_reward_risk:
-                continue
-
-            rationale = self._build_rationale(row, pop, reward_risk, strategy_type, iv_rank)
-
-            recs.append(
-                TradeRecommendation(
-                    ticker=row["ticker"],
-                    expiry=row["expiry"],
-                    dte=int(row["dte"]),
-                    option_type=opt_type,
-                    strike=float(row["strike"]),
-                    underlying_price=float(row["underlying"]),
-                    entry_price=entry,
-                    delta=delta,
-                    theta=theta,
-                    vega=vega,
-                    iv=iv * 100,
-                    iv_rank=iv_rank,
-                    pop=pop,
-                    max_loss=max_loss_per_contract,
-                    reward_risk=reward_risk,
-                    is_uoa=bool(row.get("is_uoa", False)),
-                    strategy_type=strategy_type,
-                    strategy_legs=strategy_legs,
-                    rationale=rationale,
-                )
+            rationale = self._build_rationale(
+                row, side, verdict, iv_rank, max_loss_per_contract
             )
 
-        # Sort by PoP proximity to 0.50 (most balanced), then UOA flag
-        recs.sort(key=lambda r: (not r.is_uoa, abs(r.pop - 0.50)))
-        return recs
+            rec = TradeRecommendation(
+                ticker=row["ticker"],
+                expiry=row["expiry"],
+                dte=int(row["dte"]),
+                option_type=opt_type,
+                strike=strike,
+                underlying_price=underlying,
+                entry_price=entry,
+                delta=delta,
+                theta=theta,
+                vega=vega,
+                iv=iv * 100,
+                iv_rank=iv_rank,
+                pop=pop,
+                max_loss=max_loss_per_contract,
+                reward_risk=2.0,  # 2× target / 1× cost for long options
+                is_uoa=bool(row.get("is_uoa", False)),
+                strategy_type=strategy_type,
+                strategy_legs=(
+                    f"Buy 1 ATM {side}. Max loss = premium paid (${max_loss_per_contract:,.0f})."
+                ),
+                rationale=rationale,
+                directional_verdict=verdict,
+                directional_confidence=confidence,
+            )
+            recs_with_volume.append((rec, volume))
+
+        # Sort: nearest to ATM first, then UOA flag (True first), then volume (desc)
+        recs_with_volume.sort(
+            key=lambda rv: (
+                abs(rv[0].strike - rv[0].underlying_price) / max(rv[0].underlying_price, _MIN_UNDERLYING_PRICE),
+                not rv[0].is_uoa,
+                -rv[1],
+            )
+        )
+        return [rv[0] for rv in recs_with_volume[:5]]
 
     def position_size(self, entry_price: float) -> int:
         """Return the number of contracts to buy given max dollar risk."""
@@ -281,7 +278,7 @@ class StrategyEngine:
 
         elif rec.strategy_type == "Bull Put Credit Spread":
             # Max profit = entry * 100, Max loss = (spread_width - entry) * 100
-            spread_width = entry * _SPREAD_WIDTH_MULTIPLIER
+            spread_width = entry * 1.5  # proxy: short leg ~50% OTM
             max_profit = entry * 100
             max_loss = (spread_width - entry) * 100
             short_put = strike * 0.95
@@ -296,7 +293,7 @@ class StrategyEngine:
             )
 
         elif rec.strategy_type == "Bear Call Credit Spread":
-            spread_width = entry * _SPREAD_WIDTH_MULTIPLIER
+            spread_width = entry * 1.5
             max_profit = entry * 100
             max_loss = (spread_width - entry) * 100
             short_call = strike * 1.05
@@ -311,7 +308,7 @@ class StrategyEngine:
             )
 
         elif rec.strategy_type == "Iron Condor":
-            spread_width = entry * _SPREAD_WIDTH_MULTIPLIER
+            spread_width = entry * 1.5
             max_profit = entry * 100
             max_loss = (spread_width - entry) * 100
             put_short = strike * 0.95
@@ -349,96 +346,150 @@ class StrategyEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _select_strategy(
+    def _compute_directional_signal(
         self,
-        opt_type: str,
-        iv_rank: float,
-        iv_vs_hv: float,
-        delta: float,
-    ) -> tuple[StrategyType, str]:
+        ranked_candidates: pd.DataFrame,
+    ) -> tuple[str, str, str]:
         """
-        Select strategy type based on IV Rank regime.
+        Determine recommended side (``"call"`` or ``"put"``), a human-readable
+        verdict string, and a confidence level (``"High"``, ``"Medium"``,
+        ``"Low"``).
 
-        Returns (strategy_type, strategy_legs_description).
+        Logic:
+        * ``market_view == "bullish"``  → call
+        * ``market_view == "bearish"``  → put
+        * ``market_view == "neutral"``  → use UOA flow then IV skew to break tie
         """
-        if iv_rank < _IV_LOW:
-            # LOW IV → buy premium
-            if opt_type == "call":
-                return (
-                    "Long Call",
-                    "Buy 1 ATM/near-ATM call. IV is cheap — buying premium is advantageous. "
-                    "Max loss = premium paid.",
-                )
-            else:
-                return (
-                    "Long Put",
-                    "Buy 1 ATM/near-ATM put. IV is cheap — buying premium is advantageous. "
-                    "Max loss = premium paid.",
-                )
+        # ── UOA flow ─────────────────────────────────────────────────────
+        uoa_calls = 0
+        uoa_puts = 0
+        if not ranked_candidates.empty and "is_uoa" in ranked_candidates.columns:
+            uoa_df = ranked_candidates[ranked_candidates["is_uoa"].astype(bool)]
+            uoa_calls = int((uoa_df["type"] == "call").sum())
+            uoa_puts = int((uoa_df["type"] == "put").sum())
 
-        elif iv_rank < _IV_MOD:
-            # MODERATE IV → debit spreads
-            if opt_type == "call":
-                return (
-                    "Bull Call Spread",
-                    "Buy 1 ATM call + Sell 1 OTM call (~5% above spot). "
-                    "Moderate IV — debit spread limits premium cost while capping upside.",
-                )
-            else:
-                return (
-                    "Bear Put Spread",
-                    "Buy 1 ATM put + Sell 1 OTM put (~5% below spot). "
-                    "Moderate IV — debit spread limits premium cost while capping downside capture.",
-                )
+        uoa_signal = ""
+        if uoa_calls > uoa_puts:
+            uoa_signal = "Bullish UOA"
+        elif uoa_puts > uoa_calls:
+            uoa_signal = "Bearish UOA"
 
-        elif iv_rank < _IV_HIGH:
-            # HIGH IV → credit spreads
-            if opt_type == "call":
-                return (
-                    "Bear Call Credit Spread",
-                    "Sell 1 OTM call + Buy 1 further OTM call as hedge. "
-                    "IV elevated — selling premium via credit spread to profit from IV crush.",
+        # ── IV skew (compare mean ATM call IV vs put IV) ──────────────────
+        iv_skew_signal = "neutral"
+        iv_skew_note = ""
+        if not ranked_candidates.empty and "iv" in ranked_candidates.columns:
+            if "underlying" in ranked_candidates.columns:
+                atm_mask = (
+                    abs(ranked_candidates["strike"] - ranked_candidates["underlying"])
+                    / ranked_candidates["underlying"].clip(lower=_MIN_UNDERLYING_PRICE)
+                    <= _IV_SKEW_ATM_WINDOW
                 )
-            else:
-                return (
-                    "Bull Put Credit Spread",
-                    "Sell 1 OTM put + Buy 1 further OTM put as hedge. "
-                    "IV elevated — selling premium via credit spread to profit from IV crush.",
-                )
+                atm_df = ranked_candidates[atm_mask]
+                if not atm_df.empty:
+                    call_iv_mean = atm_df.loc[atm_df["type"] == "call", "iv"].mean()
+                    put_iv_mean = atm_df.loc[atm_df["type"] == "put", "iv"].mean()
+                    if pd.notna(call_iv_mean) and pd.notna(put_iv_mean):
+                        if put_iv_mean > call_iv_mean * _IV_SKEW_THRESHOLD:
+                            iv_skew_signal = "bearish"
+                            iv_skew_note = "Put IV skew"
+                        elif call_iv_mean > put_iv_mean * _IV_SKEW_THRESHOLD:
+                            iv_skew_signal = "bullish"
+                            iv_skew_note = "Call IV skew"
 
+        # ── Determine side ───────────────────────────────────────────────
+        if self.market_view == "bullish":
+            side = "call"
+        elif self.market_view == "bearish":
+            side = "put"
+        else:  # neutral — let flow / skew decide
+            if uoa_calls > uoa_puts:
+                side = "call"
+            elif uoa_puts > uoa_calls:
+                side = "put"
+            elif iv_skew_signal == "bullish":
+                side = "call"
+            elif iv_skew_signal == "bearish":
+                side = "put"
+            else:
+                side = "call"  # default when no signal
+
+        # ── Confidence ───────────────────────────────────────────────────
+        confirming = 0
+        conflicting = False
+        if self.market_view == "bullish":
+            if uoa_signal == "Bullish UOA":
+                confirming += 1
+            elif uoa_signal == "Bearish UOA":
+                conflicting = True
+            if iv_skew_signal == "bullish":
+                confirming += 1
+            elif iv_skew_signal == "bearish":
+                conflicting = True
+        elif self.market_view == "bearish":
+            if uoa_signal == "Bearish UOA":
+                confirming += 1
+            elif uoa_signal == "Bullish UOA":
+                conflicting = True
+            if iv_skew_signal == "bearish":
+                confirming += 1
+            elif iv_skew_signal == "bullish":
+                conflicting = True
+        else:  # neutral
+            if abs(uoa_calls - uoa_puts) >= _UOA_SIGNIFICANCE_THRESHOLD:
+                confirming += 1
+            if iv_skew_signal != "neutral":
+                confirming += 1
+
+        if conflicting:
+            confidence = "Low"
+        elif confirming >= 2:
+            confidence = "High"
+        elif confirming == 1 or self.market_view != "neutral":
+            confidence = "Medium"
         else:
-            # VERY HIGH IV → Iron Condor
-            return (
-                "Iron Condor",
-                "Sell OTM call + Sell OTM put + Buy further OTM call wing + Buy further OTM put wing. "
-                "IV very high — Iron Condor collects rich premium from both sides.",
-            )
+            confidence = "Low"
+
+        # ── Build verdict string ─────────────────────────────────────────
+        reasons: list[str] = []
+        if self.market_view != "neutral":
+            reasons.append(f"{self.market_view.title()} view")
+        if uoa_signal:
+            reasons.append(uoa_signal)
+        if iv_skew_note:
+            reasons.append(iv_skew_note)
+        reason_str = " + ".join(reasons) if reasons else "No clear signal"
+
+        if side == "call":
+            verdict = f"🟢 BUY CALL — {reason_str}"
+        else:
+            verdict = f"🔴 BUY PUT — {reason_str}"
+
+        return side, verdict, confidence
 
     def _build_rationale(
         self,
         row: pd.Series,
-        pop: float,
-        reward_risk: float,
-        strategy_type: StrategyType = "Long Call",
-        iv_rank: float = 50.0,
+        side: str,
+        verdict: str,
+        iv_rank: float,
+        max_loss: float,
     ) -> str:
-        # IV regime note
-        if iv_rank < _IV_LOW:
-            iv_note = "⬇️ Low IV — Buy premium"
-        elif iv_rank < _IV_MOD:
-            iv_note = "➡️ Moderate IV — Debit spread"
-        elif iv_rank < _IV_HIGH:
-            iv_note = "⬆️ High IV — Credit spread (avoid IV crush)"
-        else:
-            iv_note = "🔥 Very High IV — Iron Condor / sell vol"
+        """Build a plain-English rationale for a single recommendation."""
+        parts: list[str] = [verdict]
 
-        parts = [f"[{strategy_type}]", iv_note]
+        # IV context
+        if iv_rank >= 70:
+            parts.append("⚠️ Very High IV — premium is expensive, size down")
+        elif iv_rank >= 50:
+            parts.append("⚠️ Elevated IV — premium may be pricey")
+        elif iv_rank < 30:
+            parts.append("✅ Low IV — favorable environment to buy premium")
+
         if row.get("is_uoa"):
             parts.append(f"UOA: {row['vol_oi_ratio']:.1f}× Vol/OI")
-        if float(row.get("iv_rank", 0)) > 50:
-            parts.append(f"IV Rank {row['iv_rank']:.0f}%")
-        if float(row.get("iv_vs_hv", 1.0)) > 1.2:
-            parts.append(f"IV/HV={row['iv_vs_hv']:.2f}")
-        parts.append(f"PoP≈{pop * 100:.0f}%")
-        parts.append(f"R:R={reward_risk:.1f}×")
+
+        parts.append(
+            f"ATM strike ${float(row['strike']):.2f} | expiry {row['expiry']} ({int(row['dte'])} DTE)"
+        )
+        parts.append(f"Max loss = ${max_loss:,.0f} per contract")
         return " | ".join(parts)
