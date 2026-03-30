@@ -163,8 +163,8 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Scanner Params")
     scanner_cfg = CFG.get("scanner", {})
-    min_dte = st.slider("Min DTE", 1, 30, scanner_cfg.get("dte_range", [7, 60])[0])
-    max_dte = st.slider("Max DTE", 15, 120, scanner_cfg.get("dte_range", [7, 60])[1])
+    min_dte = st.slider("Min DTE", 0, 30, scanner_cfg.get("dte_range", [0, 60])[0])
+    max_dte = st.slider("Max DTE", 15, 120, scanner_cfg.get("dte_range", [0, 60])[1])
     min_vol = st.number_input("Min Volume", min_value=1, value=int(scanner_cfg.get("min_volume", 50)))
     uoa_ratio = st.number_input("UOA Vol/OI Threshold", min_value=1.0, value=float(scanner_cfg.get("uoa_vol_oi_ratio", 5.0)), step=0.5)
     max_spread = st.slider("Max Spread %", 1, 50, int(float(scanner_cfg.get("max_spread_pct", 0.20)) * 100)) / 100.0
