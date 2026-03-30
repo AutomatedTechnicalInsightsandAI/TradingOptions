@@ -175,7 +175,7 @@ with st.sidebar:
     strategy_cfg = CFG.get("strategy", {})
     account_size = st.number_input("Account Size ($)", min_value=1000, value=int(strategy_cfg.get("account_size", 25000)), step=1000)
     risk_pct = st.slider("Risk per Trade (%)", 1, 10, int(float(strategy_cfg.get("risk_per_trade", 0.02)) * 100)) / 100.0
-    min_rr = st.number_input("Min Reward:Risk", min_value=1.0, value=float(strategy_cfg.get("min_reward_risk", 2.0)), step=0.5)
+    max_premium = st.number_input("Max Premium / Contract ($)", min_value=50, value=int(strategy_cfg.get("max_premium", 500)), step=50)
 
     st.markdown("---")
     refresh_sec = st.number_input("Auto-refresh (sec, 0=off)", min_value=0, value=int(CFG.get("dashboard", {}).get("refresh_seconds", 300)), step=30)
@@ -209,7 +209,7 @@ if run_scan or auto_refresh:
         engine = StrategyEngine(
             market_view=market_view,
             vol_view=vol_view,
-            min_reward_risk=min_rr,
+            max_premium=max_premium,
             account_size=account_size,
             risk_per_trade=risk_pct,
         )
@@ -668,31 +668,48 @@ if selected_ticker:
 st.header(f"💡 Trade Recommendations ({market_view.title()} View)")
 
 if not recommendations:
-    st.info("No recommendations met the current risk/reward and PoP criteria. Try adjusting the strategy parameters.")
+    st.info(
+        "No ATM contracts found matching current filters. "
+        "Try increasing **Max Premium / Contract** or widening the DTE range."
+    )
 else:
     engine = StrategyEngine(
         market_view=market_view,
         vol_view=vol_view,
-        min_reward_risk=min_rr,
+        max_premium=max_premium,
         account_size=account_size,
         risk_per_trade=risk_pct,
     )
 
-    for i, rec in enumerate(recommendations[:10]):
+    # ── Directional verdict banner ────────────────────────────────────────
+    first = recommendations[0]
+    verdict = first.directional_verdict
+    confidence = first.directional_confidence
+
+    if "BUY CALL" in verdict:
+        st.success(f"### 🟢 SIGNAL: BUY CALLS  •  Confidence: {confidence}")
+    elif "BUY PUT" in verdict:
+        st.error(f"### 🔴 SIGNAL: BUY PUTS  •  Confidence: {confidence}")
+    else:
+        st.info(f"### ⬜ NO CLEAR SIGNAL — Market neutral  •  Confidence: {confidence}")
+
+    st.caption(verdict)
+
+    for i, rec in enumerate(recommendations):
         contracts = engine.position_size(rec.entry_price)
         total_risk = rec.max_loss * contracts
 
         with st.expander(
             f"{'🟢' if rec.option_type == 'call' else '🔴'} "
-            f"**{rec.ticker}** {rec.strike} {rec.option_type.upper()} "
-            f"exp {rec.expiry} | PoP {rec.pop * 100:.0f}% | Entry ${rec.entry_price:.2f}"
+            f"**{rec.ticker}** ${rec.strike:.2f} {rec.option_type.upper()} "
+            f"exp {rec.expiry} ({rec.dte} DTE) | Entry ${rec.entry_price:.2f}"
             + (" 🚨 UOA" if rec.is_uoa else ""),
             expanded=(i == 0),
         ):
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Entry (mid)", f"${rec.entry_price:.2f}")
             c2.metric("Max Loss / contract", f"${rec.max_loss:,.0f}")
-            c3.metric("PoP", f"{rec.pop * 100:.0f}%")
+            c3.metric("Delta", f"{rec.delta:.3f}")
             c4.metric("Suggested Contracts", str(contracts))
             c5.metric("Total Risk $", f"${total_risk:,.0f}")
 
@@ -708,26 +725,28 @@ else:
                 }])
                 st.dataframe(greeks_df, use_container_width=True, hide_index=True)
 
-                # Strategy badge
-                _strat = rec.strategy_type
-                if _strat in ("Bull Put Credit Spread", "Bear Call Credit Spread", "Iron Condor"):
-                    st.warning(f"📋 Recommended Strategy: **{_strat}**")
-                elif _strat in ("Long Call", "Long Put", "Long Straddle", "Long Strangle"):
-                    st.success(f"📋 Recommended Strategy: **{_strat}**")
+                # Strategy badge — always Long Call / Long Put
+                if rec.option_type == "call":
+                    st.success("📋 Strategy: **Long Call** — buy ATM call, max loss = premium paid")
                 else:
-                    st.info(f"📋 Recommended Strategy: **{_strat}**")
+                    st.error("📋 Strategy: **Long Put** — buy ATM put, max loss = premium paid")
 
-                # Strategy legs explanation
+                # Strategy legs description
                 st.info(rec.strategy_legs)
 
-                # IV regime warning
-                if rec.iv_rank >= 50:
+                # IV warning
+                if rec.iv_rank >= 70:
                     st.warning(
-                        "⚠️ IV Rank is elevated. Buying naked options risks IV crush. "
-                        "The recommended credit strategy above accounts for this."
+                        "🔥 IV Rank is very high — premium is expensive. "
+                        "Size down to limit dollar exposure."
+                    )
+                elif rec.iv_rank >= 50:
+                    st.warning(
+                        "⚠️ IV Rank is elevated — premium may be pricey. "
+                        "Consider sizing down."
                     )
                 elif rec.iv_rank < 30:
-                    st.success("✅ IV Rank is low — this is a favorable environment to buy premium.")
+                    st.success("✅ Low IV Rank — favorable environment to buy premium.")
 
                 # IV Rank metric
                 _iv_r = rec.iv_rank
