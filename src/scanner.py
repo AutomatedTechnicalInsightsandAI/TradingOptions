@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_UOA_RATIO = 5.0    # flag if volume / open_interest > this
 DEFAULT_MIN_VOLUME = 50
 DEFAULT_MAX_SPREAD_PCT = 0.20
-DEFAULT_DTE_RANGE = (7, 60)
+DEFAULT_DTE_RANGE = (0, 60)
 DEFAULT_HV_WINDOW = 30
 DEFAULT_RISK_FREE_RATE = 0.053
 

@@ -23,7 +23,7 @@ scanner:
   # Maximum bid-ask spread (as pct of mid-price) to consider "tight"
   max_spread_pct: 0.20
   # Days-to-expiration window to consider [min, max]
-  dte_range: [7, 60]
+  dte_range: [0, 60]
   # Number of top ranked candidates to display
   top_n: 20
 
